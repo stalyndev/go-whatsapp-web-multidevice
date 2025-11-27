@@ -475,6 +475,8 @@ func handler(ctx context.Context, rawEvt any, chatStorageRepo domainChatStorage.
 		handleAppState(ctx, evt)
 	case *events.GroupInfo:
 		handleGroupInfo(ctx, evt)
+	case *events.OfflineSyncCompleted:
+		handleOfflineSyncCompleted(ctx)
 	default:
 		// Log unhandled events during initial sync for debugging
 		if isInitialSync.Load() {
@@ -642,20 +644,31 @@ func handlePairSuccess(ctx context.Context, evt *events.PairSuccess) {
 	
 	// CRITICAL: Send presence to help initiate sync process
 	// This signals to WhatsApp that we're ready to receive sync data
+	// But we need PushName first - it will be set by PushNameSetting event
 	if cli != nil {
-		logrus.Info("[PAIR_SUCCESS] Sending presence to initiate mobile sync...")
-		if err := cli.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
-			logrus.Warnf("[PAIR_SUCCESS] Failed to send presence (may retry): %v", err)
-			// Retry after a moment
-			time.Sleep(2 * time.Second)
-			if err := cli.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
-				logrus.Errorf("[PAIR_SUCCESS] Failed to send presence on retry: %v", err)
-			} else {
-				logrus.Info("[PAIR_SUCCESS] ✅ Presence sent successfully on retry")
+		logrus.Info("[PAIR_SUCCESS] Waiting for PushName before sending presence...")
+		// Wait for PushName to be set (will come via PushNameSetting event)
+		// Start a goroutine to send presence once PushName is available
+		go func() {
+			maxWait := 30 * time.Second
+			checkInterval := 1 * time.Second
+			elapsed := time.Duration(0)
+			
+			for elapsed < maxWait {
+				if cli != nil && cli.Store.PushName != "" {
+					logrus.Info("[PAIR_SUCCESS] PushName available, sending presence...")
+					if err := cli.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
+						logrus.Warnf("[PAIR_SUCCESS] Failed to send presence: %v", err)
+					} else {
+						logrus.Info("[PAIR_SUCCESS] ✅ Presence sent successfully - mobile sync should start")
+					}
+					return
+				}
+				time.Sleep(checkInterval)
+				elapsed += checkInterval
 			}
-		} else {
-			logrus.Info("[PAIR_SUCCESS] ✅ Presence sent successfully - mobile sync should start")
-		}
+			logrus.Warn("[PAIR_SUCCESS] PushName not set after 30 seconds - presence will be sent when available")
+		}()
 	}
 	
 	// CRITICAL: Ensure connection stays active during mobile sync
@@ -867,17 +880,69 @@ func handleLoggedOut(ctx context.Context, evt *events.LoggedOut, chatStorageRepo
 	}
 }
 
+func handleOfflineSyncCompleted(ctx context.Context) {
+	logrus.Info("[OFFLINE_SYNC] ✅ Offline sync completed - mobile device has finished initial synchronization")
+	
+	// Disable initial sync protection if still active
+	if isInitialSync.Load() {
+		isInitialSync.Store(false)
+		syncDuration := time.Now().Unix() - syncStartTime.Load()
+		logrus.Infof("[OFFLINE_SYNC] Initial sync protection disabled - sync took %d seconds", syncDuration)
+	}
+	
+	if cli != nil {
+		logrus.Infof("[OFFLINE_SYNC] Connection state - IsConnected: %v, IsLoggedIn: %v", 
+			cli.IsConnected(), cli.IsLoggedIn())
+		
+		// Send presence now that sync is complete
+		if len(cli.Store.PushName) > 0 {
+			if err := cli.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
+				logrus.Warnf("[OFFLINE_SYNC] Failed to send presence: %v", err)
+			} else {
+				logrus.Info("[OFFLINE_SYNC] ✅ Presence sent after offline sync completion")
+			}
+		} else {
+			logrus.Info("[OFFLINE_SYNC] PushName not set yet - presence will be sent when PushNameSetting event arrives")
+		}
+	}
+	
+	// Broadcast that offline sync is complete
+	websocket.Broadcast <- websocket.BroadcastMessage{
+		Code:    "OFFLINE_SYNC_COMPLETE",
+		Message: "Mobile device offline sync completed - linking should be successful",
+		Result:  nil,
+	}
+	
+	logrus.Info("[OFFLINE_SYNC] ✅ Mobile device should now show 'Linked' status")
+}
+
 func handleConnectionEvents(_ context.Context) {
+	if cli == nil {
+		return
+	}
+	
+	// Log connection event
+	logrus.Infof("[CONNECTION_EVENT] Connection event - PushName: %s, IsConnected: %v, IsLoggedIn: %v", 
+		cli.Store.PushName, cli.IsConnected(), cli.IsLoggedIn())
+	
 	if len(cli.Store.PushName) == 0 {
+		logrus.Info("[CONNECTION_EVENT] PushName not set yet - will send presence when available")
 		return
 	}
 
 	// Send presence available when connecting and when the pushname is changed.
 	// This makes sure that outgoing messages always have the right pushname.
+	logrus.Info("[CONNECTION_EVENT] Sending presence with PushName...")
 	if err := cli.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
 		log.Warnf("Failed to send available presence: %v", err)
 	} else {
 		log.Infof("Marked self as available")
+		logrus.Info("[CONNECTION_EVENT] ✅ Presence sent successfully")
+		
+		// If we're in initial sync, this helps the mobile device continue syncing
+		if isInitialSync.Load() {
+			logrus.Info("[CONNECTION_EVENT] Presence sent during initial sync - mobile device can continue")
+		}
 	}
 }
 
