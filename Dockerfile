@@ -20,8 +20,6 @@ ENV TZ=UTC
 WORKDIR /app
 # Copy compiled from builder.
 COPY --from=builder /app/whatsapp /app/whatsapp
-# Run the binary.
-ENTRYPOINT ["/app/whatsapp"]
-
-CMD [ "rest" ]
+# Run the binary with rest command
+CMD ["/app/whatsapp", "rest"]
 
