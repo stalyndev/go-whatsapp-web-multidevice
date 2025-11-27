@@ -618,7 +618,50 @@ func handleLoggedOut(ctx context.Context, evt *events.LoggedOut, chatStorageRepo
 	logrus.Warnf("[REMOTE_LOGOUT] Received LoggedOut event - Reason: %v, OnConnect: %v", 
 		evt.Reason, evt.OnConnect)
 	
-	// Log current connection state
+	// CRITICAL: Check if logout is due to another device FIRST (before any other processing)
+	// This must be checked immediately to prevent cleanup of valid sessions
+	logoutReason := fmt.Sprintf("%v", evt.Reason)
+	isAnotherDeviceLogout := strings.Contains(logoutReason, "another device") || 
+	                          strings.Contains(logoutReason, "401") ||
+	                          strings.Contains(logoutReason, "logged out from another")
+	
+	if isAnotherDeviceLogout {
+		logrus.Warnf("[REMOTE_LOGOUT] ⚠️  Logout due to another device session - this is TEMPORARY")
+		logrus.Warnf("[REMOTE_LOGOUT] Session will be restored when the other device disconnects")
+		logrus.Warnf("[REMOTE_LOGOUT] NOT performing cleanup - preserving session data")
+		
+		// Log current state for debugging
+		if cli != nil {
+			logrus.Infof("[REMOTE_LOGOUT] Current state - IsConnected: %v, IsLoggedIn: %v", 
+				cli.IsConnected(), cli.IsLoggedIn())
+			if cli.Store.ID != nil {
+				logrus.Infof("[REMOTE_LOGOUT] Preserving device: %s", cli.Store.ID.String())
+			}
+		}
+		
+		// Verify device is still in database
+		if db != nil {
+			devices, err := db.GetAllDevices(ctx)
+			if err == nil && len(devices) > 0 {
+				logrus.Infof("[REMOTE_LOGOUT] ✅ Device preserved in database: %d device(s) found", len(devices))
+			}
+		}
+		
+		// Just disconnect, but keep the session data
+		if cli != nil {
+			cli.Disconnect()
+			logrus.Info("[REMOTE_LOGOUT] Client disconnected (session data preserved)")
+		}
+		
+		websocket.Broadcast <- websocket.BroadcastMessage{
+			Code:    "LOGOUT_ANOTHER_DEVICE",
+			Message: "Logged out due to another device session. Close WhatsApp on your phone to restore this session.",
+			Result:  nil,
+		}
+		return // CRITICAL: Exit immediately, do not proceed with cleanup
+	}
+	
+	// Log current connection state (only if not another device logout)
 	if cli != nil {
 		logrus.Infof("[REMOTE_LOGOUT] Current state - IsConnected: %v, IsLoggedIn: %v", 
 			cli.IsConnected(), cli.IsLoggedIn())
