@@ -44,6 +44,8 @@ var (
 	log           waLog.Logger
 	historySyncID int32
 	startupTime   = time.Now().Unix()
+	isInitialSync = atomic.Bool{} // Track if we're in initial sync phase
+	syncStartTime = atomic.Int64{} // Track when sync started
 )
 
 // InitWaDB initializes the WhatsApp database connection
@@ -442,6 +444,12 @@ func handleRemoteLogout(ctx context.Context, chatStorageRepo domainChatStorage.I
 
 // handler is the main event handler for WhatsApp events
 func handler(ctx context.Context, rawEvt any, chatStorageRepo domainChatStorage.IChatStorageRepository) {
+	// Log all events for debugging (especially during initial sync)
+	eventType := fmt.Sprintf("%T", rawEvt)
+	if isInitialSync.Load() {
+		logrus.Infof("[EVENT] Received event during initial sync: %s", eventType)
+	}
+	
 	switch evt := rawEvt.(type) {
 	case *events.DeleteForMe:
 		handleDeleteForMe(ctx, evt, chatStorageRepo)
@@ -467,6 +475,11 @@ func handler(ctx context.Context, rawEvt any, chatStorageRepo domainChatStorage.
 		handleAppState(ctx, evt)
 	case *events.GroupInfo:
 		handleGroupInfo(ctx, evt)
+	default:
+		// Log unhandled events during initial sync for debugging
+		if isInitialSync.Load() {
+			logrus.Infof("[EVENT] Unhandled event during initial sync: %s", eventType)
+		}
 	}
 }
 
@@ -507,35 +520,59 @@ func handleDeleteForMe(ctx context.Context, evt *events.DeleteForMe, chatStorage
 func handleAppStateSyncComplete(ctx context.Context, evt *events.AppStateSyncComplete) {
 	logrus.Infof("[APP_STATE_SYNC] App state sync complete: %s", evt.Name)
 	
-	if len(cli.Store.PushName) > 0 && evt.Name == appstate.WAPatchCriticalBlock {
-		if err := cli.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
-			log.Warnf("Failed to send available presence: %v", err)
-		} else {
-			log.Infof("Marked self as available")
-		}
-	}
-	
-	// After critical app state sync, verify session is persisted
-	if evt.Name == appstate.WAPatchCriticalBlock && cli != nil && cli.Store.ID != nil {
-		logrus.Infof("[APP_STATE_SYNC] Verifying session persistence for device: %s", cli.Store.ID.String())
+	// CRITICAL: When critical block sync completes, mobile device has finished initial sync
+	if evt.Name == appstate.WAPatchCriticalBlock {
+		logrus.Info("[APP_STATE_SYNC] ✅ Critical app state sync completed - mobile device sync should be finishing")
 		
-		// Verify device exists in database
-		if db != nil {
-			devices, err := db.GetAllDevices(ctx)
-			if err != nil {
-				logrus.Errorf("[APP_STATE_SYNC] Error verifying device in database: %v", err)
+		// Disable initial sync protection - sync is complete
+		if isInitialSync.Load() {
+			isInitialSync.Store(false)
+			syncDuration := time.Now().Unix() - syncStartTime.Load()
+			logrus.Infof("[APP_STATE_SYNC] Initial sync protection disabled - sync took %d seconds", syncDuration)
+		}
+		
+		if cli != nil {
+			logrus.Infof("[APP_STATE_SYNC] Connection state - IsConnected: %v, IsLoggedIn: %v", 
+				cli.IsConnected(), cli.IsLoggedIn())
+		}
+		
+		if len(cli.Store.PushName) > 0 {
+			if err := cli.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
+				log.Warnf("Failed to send available presence: %v", err)
 			} else {
-				found := false
-				for _, d := range devices {
-					if d.ID != nil && d.ID.String() == cli.Store.ID.String() {
-						found = true
-						logrus.Infof("[APP_STATE_SYNC] Device verified in database: %s", d.ID.String())
-						break
+				log.Infof("Marked self as available")
+			}
+		}
+		
+		// After critical app state sync, verify session is persisted
+		if cli != nil && cli.Store.ID != nil {
+			logrus.Infof("[APP_STATE_SYNC] Verifying session persistence for device: %s", cli.Store.ID.String())
+			
+			// Verify device exists in database
+			if db != nil {
+				devices, err := db.GetAllDevices(ctx)
+				if err != nil {
+					logrus.Errorf("[APP_STATE_SYNC] Error verifying device in database: %v", err)
+				} else {
+					found := false
+					for _, d := range devices {
+						if d.ID != nil && d.ID.String() == cli.Store.ID.String() {
+							found = true
+							logrus.Infof("[APP_STATE_SYNC] ✅ Device verified in database: %s", d.ID.String())
+							break
+						}
+					}
+					if !found {
+						logrus.Warn("[APP_STATE_SYNC] WARNING: Device not found in database after sync - session may not be persisted!")
 					}
 				}
-				if !found {
-					logrus.Warn("[APP_STATE_SYNC] WARNING: Device not found in database after sync - session may not be persisted!")
-				}
+			}
+			
+			// Broadcast that sync is complete
+			websocket.Broadcast <- websocket.BroadcastMessage{
+				Code:    "SYNC_COMPLETE",
+				Message: "Mobile device sync completed successfully",
+				Result:  nil,
 			}
 		}
 	}
@@ -543,6 +580,22 @@ func handleAppStateSyncComplete(ctx context.Context, evt *events.AppStateSyncCom
 
 func handlePairSuccess(ctx context.Context, evt *events.PairSuccess) {
 	logrus.Infof("[PAIR_SUCCESS] Successfully paired with device: %s", evt.ID.String())
+	logrus.Info("[PAIR_SUCCESS] ⚠️  IMPORTANT: Mobile device is now syncing - DO NOT disconnect!")
+	logrus.Info("[PAIR_SUCCESS] Waiting for AppStateSyncComplete and HistorySync to finish...")
+	
+	// Mark that we're in initial sync phase - protect against premature disconnection
+	isInitialSync.Store(true)
+	syncStartTime.Store(time.Now().Unix())
+	logrus.Info("[PAIR_SUCCESS] Initial sync protection enabled - will disable after 3 minutes or AppStateSyncComplete")
+	
+	// Start a goroutine to disable sync protection after timeout (safety measure)
+	go func() {
+		time.Sleep(3 * time.Minute)
+		if isInitialSync.Load() {
+			logrus.Warn("[PAIR_SUCCESS] Initial sync protection timeout - disabling (sync may have completed)")
+			isInitialSync.Store(false)
+		}
+	}()
 	
 	// Log current connection state
 	if cli != nil {
@@ -587,30 +640,63 @@ func handlePairSuccess(ctx context.Context, evt *events.PairSuccess) {
 		}
 	}
 	
-	// Verify connection is still active after sync
-	time.Sleep(1 * time.Second)
+	// CRITICAL: Send presence to help initiate sync process
+	// This signals to WhatsApp that we're ready to receive sync data
+	if cli != nil {
+		logrus.Info("[PAIR_SUCCESS] Sending presence to initiate mobile sync...")
+		if err := cli.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
+			logrus.Warnf("[PAIR_SUCCESS] Failed to send presence (may retry): %v", err)
+			// Retry after a moment
+			time.Sleep(2 * time.Second)
+			if err := cli.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
+				logrus.Errorf("[PAIR_SUCCESS] Failed to send presence on retry: %v", err)
+			} else {
+				logrus.Info("[PAIR_SUCCESS] ✅ Presence sent successfully on retry")
+			}
+		} else {
+			logrus.Info("[PAIR_SUCCESS] ✅ Presence sent successfully - mobile sync should start")
+		}
+	}
+	
+	// CRITICAL: Ensure connection stays active during mobile sync
+	// Do NOT disconnect or interfere with the sync process
+	// The mobile device needs time to complete HistorySync and AppStateSyncComplete
+	logrus.Info("[PAIR_SUCCESS] Connection will remain active to allow mobile sync to complete")
+	logrus.Info("[PAIR_SUCCESS] Waiting for HistorySync and AppStateSyncComplete events...")
+	
+	// Wait a bit and verify connection is still active
+	time.Sleep(3 * time.Second)
 	if cli != nil {
 		logrus.Infof("[PAIR_SUCCESS] Post-sync state - IsConnected: %v, IsLoggedIn: %v", 
 			cli.IsConnected(), cli.IsLoggedIn())
 		
-		// Ensure we're still connected and logged in
+		// CRITICAL: If connection is lost, reconnect immediately
+		// The mobile device is still syncing and needs the connection
 		if !cli.IsConnected() {
-			logrus.Warn("[PAIR_SUCCESS] Connection lost after sync - attempting reconnect...")
+			logrus.Warn("[PAIR_SUCCESS] ⚠️  Connection lost during mobile sync - attempting reconnect...")
+			logrus.Warn("[PAIR_SUCCESS] This may cause mobile sync to fail!")
 			if err := cli.Connect(); err != nil {
 				logrus.Errorf("[PAIR_SUCCESS] Reconnect failed: %v", err)
 			} else {
-				logrus.Info("[PAIR_SUCCESS] Successfully reconnected after sync")
+				logrus.Info("[PAIR_SUCCESS] Successfully reconnected - mobile sync may continue")
+				// Send presence again after reconnect
+				time.Sleep(1 * time.Second)
+				if err := cli.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
+					logrus.Warnf("[PAIR_SUCCESS] Failed to send presence after reconnect: %v", err)
+				}
 			}
+		} else {
+			logrus.Info("[PAIR_SUCCESS] ✅ Connection is stable - mobile sync can proceed")
 		}
 	}
 	
 	websocket.Broadcast <- websocket.BroadcastMessage{
 		Code:    "LOGIN_SUCCESS",
-		Message: fmt.Sprintf("Successfully pair with %s", evt.ID.String()),
+		Message: fmt.Sprintf("Successfully pair with %s - mobile device is syncing...", evt.ID.String()),
 		Result:  nil,
 	}
 	
-	logrus.Info("[PAIR_SUCCESS] Pair success handling completed")
+	logrus.Info("[PAIR_SUCCESS] Pair success handling completed - waiting for mobile sync to finish")
 }
 
 func handleLoggedOut(ctx context.Context, evt *events.LoggedOut, chatStorageRepo domainChatStorage.IChatStorageRepository) {
@@ -626,6 +712,25 @@ func handleLoggedOut(ctx context.Context, evt *events.LoggedOut, chatStorageRepo
 	                          strings.Contains(logoutReason, "logged out from another")
 	
 	if isAnotherDeviceLogout {
+		// CRITICAL: If we're in initial sync phase, DO NOT disconnect!
+		// The mobile device is still syncing and needs the connection
+		if isInitialSync.Load() {
+			syncDuration := time.Now().Unix() - syncStartTime.Load()
+			logrus.Warnf("[REMOTE_LOGOUT] ⚠️  Logout detected during INITIAL SYNC (after %d seconds)", syncDuration)
+			logrus.Warnf("[REMOTE_LOGOUT] ⚠️  CRITICAL: Mobile device is still syncing - NOT disconnecting!")
+			logrus.Warnf("[REMOTE_LOGOUT] This logout will be ignored to allow sync to complete")
+			logrus.Warnf("[REMOTE_LOGOUT] Connection will remain active for mobile sync")
+			
+			// Do NOT disconnect - let the sync complete
+			// The mobile device needs the connection to finish syncing
+			websocket.Broadcast <- websocket.BroadcastMessage{
+				Code:    "SYNC_IN_PROGRESS",
+				Message: "Mobile device is syncing - connection will remain active",
+				Result:  nil,
+			}
+			return // Exit without disconnecting
+		}
+		
 		logrus.Warnf("[REMOTE_LOGOUT] ⚠️  Logout due to another device session - this is TEMPORARY")
 		logrus.Warnf("[REMOTE_LOGOUT] Session will be restored when the other device disconnects")
 		logrus.Warnf("[REMOTE_LOGOUT] NOT performing cleanup - preserving session data")
@@ -1044,13 +1149,23 @@ func handlePresence(_ context.Context, evt *events.Presence) {
 }
 
 func handleHistorySync(ctx context.Context, evt *events.HistorySync, chatStorageRepo domainChatStorage.IChatStorageRepository) {
+	syncType := evt.Data.SyncType.String()
+	logrus.Infof("[HISTORY_SYNC] 📱 Mobile device is syncing history - Type: %s", syncType)
+	logrus.Infof("[HISTORY_SYNC] ⚠️  CRITICAL: Keep connection active during sync!")
+	
+	// Log connection state during sync
+	if cli != nil {
+		logrus.Infof("[HISTORY_SYNC] Connection state - IsConnected: %v, IsLoggedIn: %v", 
+			cli.IsConnected(), cli.IsLoggedIn())
+	}
+	
 	id := atomic.AddInt32(&historySyncID, 1)
 	fileName := fmt.Sprintf("%s/history-%d-%s-%d-%s.json",
 		config.PathStorages,
 		startupTime,
 		cli.Store.ID.String(),
 		id,
-		evt.Data.SyncType.String(),
+		syncType,
 	)
 
 	file, err := os.OpenFile(fileName, os.O_WRONLY|os.O_CREATE, 0600)
@@ -1066,6 +1181,8 @@ func handleHistorySync(ctx context.Context, evt *events.HistorySync, chatStorage
 		log.Errorf("Failed to write history sync: %v", err)
 		return
 	}
+	
+	logrus.Infof("[HISTORY_SYNC] ✅ History sync data saved: %s", fileName)
 
 	log.Infof("Wrote history sync to %s", fileName)
 
