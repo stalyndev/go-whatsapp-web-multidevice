@@ -563,6 +563,30 @@ func handlePairSuccess(ctx context.Context, evt *events.PairSuccess) {
 	syncKeysDevice(ctx, db, keysDB)
 	logrus.Info("[PAIR_SUCCESS] Keys device sync completed")
 	
+	// CRITICAL: Verify device is persisted in database after pairing
+	if db != nil && cli != nil && cli.Store.ID != nil {
+		logrus.Info("[PAIR_SUCCESS] Verifying device persistence in database...")
+		devices, err := db.GetAllDevices(ctx)
+		if err != nil {
+			logrus.Errorf("[PAIR_SUCCESS] ERROR: Failed to verify device in database: %v", err)
+		} else {
+			found := false
+			for _, d := range devices {
+				if d.ID != nil && d.ID.String() == cli.Store.ID.String() {
+					found = true
+					logrus.Infof("[PAIR_SUCCESS] ✅ Device verified in database: %s (PushName: %s)", 
+						d.ID.String(), d.PushName)
+					break
+				}
+			}
+			if !found {
+				logrus.Errorf("[PAIR_SUCCESS] ❌ CRITICAL: Device NOT found in database after pairing!")
+				logrus.Errorf("[PAIR_SUCCESS] This means the session is NOT being persisted!")
+				logrus.Errorf("[PAIR_SUCCESS] Check if volume /app/storages is mounted correctly in Railway")
+			}
+		}
+	}
+	
 	// Verify connection is still active after sync
 	time.Sleep(1 * time.Second)
 	if cli != nil {
@@ -598,6 +622,36 @@ func handleLoggedOut(ctx context.Context, evt *events.LoggedOut, chatStorageRepo
 	if cli != nil {
 		logrus.Infof("[REMOTE_LOGOUT] Current state - IsConnected: %v, IsLoggedIn: %v", 
 			cli.IsConnected(), cli.IsLoggedIn())
+		
+		// Log device info if available
+		if cli.Store.ID != nil {
+			logrus.Infof("[REMOTE_LOGOUT] Store ID: %s", cli.Store.ID.String())
+		}
+	}
+	
+	// CRITICAL: Check database state BEFORE cleanup
+	if db != nil {
+		logrus.Info("[REMOTE_LOGOUT] Checking database state before cleanup...")
+		devices, err := db.GetAllDevices(ctx)
+		if err != nil {
+			logrus.Errorf("[REMOTE_LOGOUT] ERROR: Failed to get devices from database: %v", err)
+		} else {
+			logrus.Infof("[REMOTE_LOGOUT] Devices in database: %d found", len(devices))
+			if len(devices) == 0 {
+				logrus.Errorf("[REMOTE_LOGOUT] ❌ CRITICAL: Database is EMPTY - session was NOT persisted!")
+				logrus.Errorf("[REMOTE_LOGOUT] This confirms the volume /app/storages is NOT working correctly")
+				if cli != nil && cli.Store.ID != nil {
+					logrus.Errorf("[REMOTE_LOGOUT] Expected device ID: %s", cli.Store.ID.String())
+				}
+			} else {
+				for _, d := range devices {
+					logrus.Infof("[REMOTE_LOGOUT] Device in DB: %s (PushName: %s)", 
+						d.ID.String(), d.PushName)
+				}
+			}
+		}
+	} else {
+		logrus.Errorf("[REMOTE_LOGOUT] ❌ CRITICAL: Database reference is NIL!")
 	}
 	
 	// Check if this is a logout on connect (happens when session is invalid)
