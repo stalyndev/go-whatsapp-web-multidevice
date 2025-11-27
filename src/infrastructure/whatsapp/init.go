@@ -550,8 +550,33 @@ func handleConnectionEvents(_ context.Context) {
 	}
 }
 
-func handleStreamReplaced(_ context.Context) {
-	os.Exit(0)
+func handleStreamReplaced(ctx context.Context) {
+	logrus.Warn("[STREAM_REPLACED] Another WhatsApp session detected - attempting to reconnect...")
+	
+	// Disconnect current client
+	if cli != nil {
+		cli.Disconnect()
+	}
+	
+	// Wait a bit before reconnecting to avoid immediate conflicts
+	time.Sleep(2 * time.Second)
+	
+	// Attempt to reconnect
+	if cli != nil {
+		if err := cli.Connect(); err != nil {
+			logrus.Errorf("[STREAM_REPLACED] Failed to reconnect: %v", err)
+			// Don't exit - let the auto-reconnect mechanism handle it
+		} else {
+			logrus.Info("[STREAM_REPLACED] Successfully reconnected after stream replacement")
+		}
+	}
+	
+	// Broadcast notification via websocket
+	websocket.Broadcast <- websocket.BroadcastMessage{
+		Code:    "STREAM_REPLACED",
+		Message: "Another WhatsApp session detected - reconnecting...",
+		Result:  nil,
+	}
 }
 
 func handleMessage(ctx context.Context, evt *events.Message, chatStorageRepo domainChatStorage.IChatStorageRepository) {

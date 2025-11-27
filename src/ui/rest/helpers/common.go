@@ -19,8 +19,15 @@ func SetAutoReconnectChecking(cli *whatsmeow.Client) {
 	go func() {
 		for {
 			time.Sleep(5 * time.Minute)
-			if !cli.IsConnected() {
-				_ = cli.Connect()
+			if cli != nil {
+				// Check both connection and login status
+				if !cli.IsConnected() || (cli.IsConnected() && !cli.IsLoggedIn()) {
+					// If disconnected or not logged in, try to reconnect
+					if err := cli.Connect(); err != nil {
+						// Log error but continue checking
+						time.Sleep(30 * time.Second) // Wait a bit before next check if reconnect failed
+					}
+				}
 			}
 		}
 	}()

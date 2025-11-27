@@ -118,6 +118,21 @@ func (service *serviceApp) Login(_ context.Context) (response domainApp.LoginRes
 	logrus.Infof("[DEBUG] Login connection established - IsConnected: %v, IsLoggedIn: %v",
 		client.IsConnected(), client.IsLoggedIn())
 
+	// Wait a moment for the connection to stabilize after QR scan
+	time.Sleep(2 * time.Second)
+	
+	// Verify connection is still active after waiting
+	if !client.IsConnected() {
+		logrus.Warn("[DEBUG] Connection lost after login - attempting reconnect...")
+		if err := client.Connect(); err != nil {
+			logrus.Errorf("[DEBUG] Reconnect after login failed: %v", err)
+		}
+	}
+	
+	// Final verification
+	logrus.Infof("[DEBUG] Final login state - IsConnected: %v, IsLoggedIn: %v",
+		client.IsConnected(), client.IsLoggedIn())
+
 	// Ensure global client is synchronized with service client
 	whatsapp.UpdateGlobalClient(client, whatsapp.GetDB())
 
