@@ -78,7 +78,10 @@ func init() {
 func initEnvConfig() {
 	fmt.Println(viper.AllSettings())
 	// Application settings
+	// Check APP_PORT first, then fallback to PORT (for Railway, Heroku, etc.)
 	if envPort := viper.GetString("app_port"); envPort != "" {
+		config.AppPort = envPort
+	} else if envPort := viper.GetString("port"); envPort != "" {
 		config.AppPort = envPort
 	}
 	if envDebug := viper.GetBool("app_debug"); envDebug {

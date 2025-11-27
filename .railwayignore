@@ -1,0 +1,12 @@
+# Railway ignore file
+.git
+.gitignore
+.cursor
+docs
+gallery
+*.md
+LICENCE.txt
+CLAUDE.md
+docker-compose.yml
+docker/
+
