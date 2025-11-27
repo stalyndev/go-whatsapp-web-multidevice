@@ -450,7 +450,7 @@ func handler(ctx context.Context, rawEvt any, chatStorageRepo domainChatStorage.
 	case *events.PairSuccess:
 		handlePairSuccess(ctx, evt)
 	case *events.LoggedOut:
-		handleLoggedOut(ctx, chatStorageRepo)
+		handleLoggedOut(ctx, evt, chatStorageRepo)
 	case *events.Connected, *events.PushNameSetting:
 		handleConnectionEvents(ctx)
 	case *events.StreamReplaced:
@@ -504,7 +504,9 @@ func handleDeleteForMe(ctx context.Context, evt *events.DeleteForMe, chatStorage
 	}
 }
 
-func handleAppStateSyncComplete(_ context.Context, evt *events.AppStateSyncComplete) {
+func handleAppStateSyncComplete(ctx context.Context, evt *events.AppStateSyncComplete) {
+	logrus.Infof("[APP_STATE_SYNC] App state sync complete: %s", evt.Name)
+	
 	if len(cli.Store.PushName) > 0 && evt.Name == appstate.WAPatchCriticalBlock {
 		if err := cli.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
 			log.Warnf("Failed to send available presence: %v", err)
@@ -512,27 +514,154 @@ func handleAppStateSyncComplete(_ context.Context, evt *events.AppStateSyncCompl
 			log.Infof("Marked self as available")
 		}
 	}
+	
+	// After critical app state sync, verify session is persisted
+	if evt.Name == appstate.WAPatchCriticalBlock && cli != nil && cli.Store.ID != nil {
+		logrus.Infof("[APP_STATE_SYNC] Verifying session persistence for device: %s", cli.Store.ID.String())
+		
+		// Verify device exists in database
+		if db != nil {
+			devices, err := db.GetAllDevices(ctx)
+			if err != nil {
+				logrus.Errorf("[APP_STATE_SYNC] Error verifying device in database: %v", err)
+			} else {
+				found := false
+				for _, d := range devices {
+					if d.ID != nil && d.ID.String() == cli.Store.ID.String() {
+						found = true
+						logrus.Infof("[APP_STATE_SYNC] Device verified in database: %s", d.ID.String())
+						break
+					}
+				}
+				if !found {
+					logrus.Warn("[APP_STATE_SYNC] WARNING: Device not found in database after sync - session may not be persisted!")
+				}
+			}
+		}
+	}
 }
 
 func handlePairSuccess(ctx context.Context, evt *events.PairSuccess) {
+	logrus.Infof("[PAIR_SUCCESS] Successfully paired with device: %s", evt.ID.String())
+	
+	// Log current connection state
+	if cli != nil {
+		logrus.Infof("[PAIR_SUCCESS] Connection state - IsConnected: %v, IsLoggedIn: %v", 
+			cli.IsConnected(), cli.IsLoggedIn())
+		
+		// Log device info
+		if cli.Store.ID != nil {
+			logrus.Infof("[PAIR_SUCCESS] Store ID: %s", cli.Store.ID.String())
+		}
+		if cli.Store.PushName != "" {
+			logrus.Infof("[PAIR_SUCCESS] PushName: %s", cli.Store.PushName)
+		}
+	}
+	
+	// Sync keys device
+	logrus.Info("[PAIR_SUCCESS] Syncing keys device...")
+	syncKeysDevice(ctx, db, keysDB)
+	logrus.Info("[PAIR_SUCCESS] Keys device sync completed")
+	
+	// Verify connection is still active after sync
+	time.Sleep(1 * time.Second)
+	if cli != nil {
+		logrus.Infof("[PAIR_SUCCESS] Post-sync state - IsConnected: %v, IsLoggedIn: %v", 
+			cli.IsConnected(), cli.IsLoggedIn())
+		
+		// Ensure we're still connected and logged in
+		if !cli.IsConnected() {
+			logrus.Warn("[PAIR_SUCCESS] Connection lost after sync - attempting reconnect...")
+			if err := cli.Connect(); err != nil {
+				logrus.Errorf("[PAIR_SUCCESS] Reconnect failed: %v", err)
+			} else {
+				logrus.Info("[PAIR_SUCCESS] Successfully reconnected after sync")
+			}
+		}
+	}
+	
 	websocket.Broadcast <- websocket.BroadcastMessage{
 		Code:    "LOGIN_SUCCESS",
 		Message: fmt.Sprintf("Successfully pair with %s", evt.ID.String()),
+		Result:  nil,
 	}
-	syncKeysDevice(ctx, db, keysDB)
+	
+	logrus.Info("[PAIR_SUCCESS] Pair success handling completed")
 }
 
-func handleLoggedOut(ctx context.Context, chatStorageRepo domainChatStorage.IChatStorageRepository) {
-	logrus.Warn("[REMOTE_LOGOUT] Received LoggedOut event - user logged out from phone")
-
-	// Perform comprehensive cleanup
-	handleRemoteLogout(ctx, chatStorageRepo)
-
-	// Broadcast final notification that cleanup is complete and ready for new login
-	websocket.Broadcast <- websocket.BroadcastMessage{
-		Code:    "LOGOUT_COMPLETE",
-		Message: "Remote logout cleanup completed - ready for new login",
-		Result:  nil,
+func handleLoggedOut(ctx context.Context, evt *events.LoggedOut, chatStorageRepo domainChatStorage.IChatStorageRepository) {
+	// Log detailed information about the logout event
+	logrus.Warnf("[REMOTE_LOGOUT] Received LoggedOut event - Reason: %v, OnConnect: %v", 
+		evt.Reason, evt.OnConnect)
+	
+	// Log current connection state
+	if cli != nil {
+		logrus.Infof("[REMOTE_LOGOUT] Current state - IsConnected: %v, IsLoggedIn: %v", 
+			cli.IsConnected(), cli.IsLoggedIn())
+	}
+	
+	// Check if this is a logout on connect (happens when session is invalid)
+	// In this case, we should clean up immediately
+	if evt.OnConnect {
+		logrus.Warn("[REMOTE_LOGOUT] Logout occurred on connect - session is invalid, performing cleanup")
+		handleRemoteLogout(ctx, chatStorageRepo)
+		
+		websocket.Broadcast <- websocket.BroadcastMessage{
+			Code:    "LOGOUT_COMPLETE",
+			Message: fmt.Sprintf("Session invalidated: %v - cleanup completed", evt.Reason),
+			Result:  nil,
+		}
+		return
+	}
+	
+	// For other logout reasons, try to reconnect first before cleaning up
+	// This handles cases where the logout might be temporary
+	logrus.Info("[REMOTE_LOGOUT] Attempting to reconnect before cleanup...")
+	
+	// Wait a moment before attempting reconnect
+	time.Sleep(3 * time.Second)
+	
+	if cli != nil {
+		if err := cli.Connect(); err != nil {
+			logrus.Errorf("[REMOTE_LOGOUT] Reconnect failed: %v - proceeding with cleanup", err)
+			handleRemoteLogout(ctx, chatStorageRepo)
+			
+			websocket.Broadcast <- websocket.BroadcastMessage{
+				Code:    "LOGOUT_COMPLETE",
+				Message: fmt.Sprintf("Reconnect failed: %v - cleanup completed", err),
+				Result:  nil,
+			}
+		} else {
+			// Check if we're logged in after reconnect
+			time.Sleep(2 * time.Second)
+			if cli.IsLoggedIn() {
+				logrus.Info("[REMOTE_LOGOUT] Successfully reconnected and logged in - no cleanup needed")
+				websocket.Broadcast <- websocket.BroadcastMessage{
+					Code:    "RECONNECT_SUCCESS",
+					Message: "Successfully reconnected after logout event",
+					Result:  nil,
+				}
+				return
+			} else {
+				logrus.Warn("[REMOTE_LOGOUT] Reconnected but not logged in - performing cleanup")
+				handleRemoteLogout(ctx, chatStorageRepo)
+				
+				websocket.Broadcast <- websocket.BroadcastMessage{
+					Code:    "LOGOUT_COMPLETE",
+					Message: "Reconnected but session invalid - cleanup completed",
+					Result:  nil,
+				}
+			}
+		}
+	} else {
+		logrus.Warn("[REMOTE_LOGOUT] Client is nil - performing cleanup")
+		handleRemoteLogout(ctx, chatStorageRepo)
+		
+		websocket.Broadcast <- websocket.BroadcastMessage{
+			Code:    "LOGOUT_COMPLETE",
+			Message: "Client unavailable - cleanup completed",
+			Result:  nil,
+		}
 	}
 }
 
