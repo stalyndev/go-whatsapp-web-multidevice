@@ -1,0 +1,109 @@
+{
+  "family": "go-whatsapp-web",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::YOUR_ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::YOUR_ACCOUNT_ID:role/ecsTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "whatsapp-app",
+      "image": "YOUR_ECR_REPO_URL:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "APP_PORT",
+          "value": "8080"
+        },
+        {
+          "name": "APP_BASIC_AUTH",
+          "value": "usuario:contraseña"
+        },
+        {
+          "name": "APP_DEBUG",
+          "value": "false"
+        },
+        {
+          "name": "APP_OS",
+          "value": "Chrome"
+        },
+        {
+          "name": "WHATSAPP_AUTO_MARK_READ",
+          "value": "false"
+        },
+        {
+          "name": "WHATSAPP_AUTO_DOWNLOAD_MEDIA",
+          "value": "true"
+        },
+        {
+          "name": "WHATSAPP_ACCOUNT_VALIDATION",
+          "value": "true"
+        }
+      ],
+      "mountPoints": [
+        {
+          "sourceVolume": "storages",
+          "containerPath": "/app/storages",
+          "readOnly": false
+        },
+        {
+          "sourceVolume": "statics",
+          "containerPath": "/app/statics",
+          "readOnly": false
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/go-whatsapp-web",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "wget -q --no-verbose --tries=1 --spider http://localhost:8080/ || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      }
+    }
+  ],
+  "volumes": [
+    {
+      "name": "storages",
+      "efsVolumeConfiguration": {
+        "fileSystemId": "fs-xxxxxxxxx",
+        "rootDirectory": "/storages",
+        "transitEncryption": "ENABLED",
+        "authorizationConfig": {
+          "accessPointId": "fsap-xxxxxxxxx",
+          "iam": "ENABLED"
+        }
+      }
+    },
+    {
+      "name": "statics",
+      "efsVolumeConfiguration": {
+        "fileSystemId": "fs-yyyyyyyyy",
+        "rootDirectory": "/statics",
+        "transitEncryption": "ENABLED",
+        "authorizationConfig": {
+          "accessPointId": "fsap-yyyyyyyyy",
+          "iam": "ENABLED"
+        }
+      }
+    }
+  ]
+}
+
